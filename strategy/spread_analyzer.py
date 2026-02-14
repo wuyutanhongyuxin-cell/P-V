@@ -114,9 +114,17 @@ class SpreadAnalyzer:
             self.short_mean = sum(self.short_spreads) / len(self.short_spreads)
 
         # 预热进度日志
-        if not self.is_warmed_up and self.sample_count % 20 == 0:
+        if self.sample_count < self.warmup_samples:
+            # 预热中：每 20 个样本打印一次
+            if self.sample_count % 20 == 0:
+                logger.info(
+                    f"预热中: {self.sample_count}/{self.warmup_samples} | "
+                    f"long_mean={self.long_mean:.4f} short_mean={self.short_mean:.4f}"
+                )
+        elif self.sample_count == self.warmup_samples:
+            # 预热刚完成：打印最终状态
             logger.info(
-                f"预热中: {self.sample_count}/{self.warmup_samples} | "
+                f"✅ 预热完成: {self.sample_count}/{self.warmup_samples} | "
                 f"long_mean={self.long_mean:.4f} short_mean={self.short_mean:.4f}"
             )
 
