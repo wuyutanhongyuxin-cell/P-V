@@ -377,6 +377,9 @@ class ParadexInteractiveClient(BaseExchangeClient):
                     return True
                 else:
                     error = await resp.text()
+                    if "ORDER_ID_NOT_FOUND" in error:
+                        logger.debug(f"Paradex 订单已不存在 (无需取消): {order_id}")
+                        return True
                     logger.warning(f"Paradex 取消订单失败: {resp.status} - {error}")
                     return False
 

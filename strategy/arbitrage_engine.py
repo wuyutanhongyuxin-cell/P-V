@@ -86,6 +86,7 @@ class ArbitrageEngine:
         self.last_balance_report_time = time.time()
         self.last_trade_time: float = 0
         self.trade_cooldown: float = 3.0  # 交易后冷却 3 秒
+        self.consecutive_rejects: int = 0  # 连续拒绝计数
 
     # ========== 信号处理与优雅退出 ==========
 
@@ -360,10 +361,24 @@ class ArbitrageEngine:
             return
 
         # 1. Paradex 挂 POST_ONLY 买单 (maker)
-        # 价格: best_ask - tick_size (确保 maker)
         p_info = await self.paradex.get_market_info(self.paradex_market)
         tick = p_info.tick_size if p_info else Decimal("0.1")
+
+        # 价差宽度检查: 至少 2 ticks 才能安全放 POST_ONLY
+        spread_width = p_bbo.ask - p_bbo.bid
+        if spread_width <= tick:
+            logger.debug(f"Paradex 价差过窄 ({spread_width}), POST_ONLY 易被拒，跳过")
+            return
+
         order_price = p_bbo.ask - tick
+
+        # 连续拒绝退避: 连续被拒后增加冷却
+        if self.consecutive_rejects >= 3:
+            backoff = min(self.consecutive_rejects * 5, 30)
+            logger.info(f"连续 {self.consecutive_rejects} 次被拒，退避 {backoff}s")
+            self.last_trade_time = time.time() + backoff - self.trade_cooldown
+            self.consecutive_rejects = 0
+            return
 
         logger.info(f"[Paradex] 挂买单: {self.size} @ {order_price} (POST_ONLY)")
 
@@ -386,14 +401,22 @@ class ArbitrageEngine:
         fill_status = await self._wait_for_fill(order_id)
 
         if fill_status == "rejected":
-            logger.info(f"[Paradex] POST_ONLY 订单被拒 (穿越价差): {order_id}")
-            self.last_trade_time = time.time()  # 触发冷却
+            self.consecutive_rejects += 1
+            logger.info(
+                f"[Paradex] POST_ONLY 被拒 (穿越价差): {order_id[-8:]} "
+                f"(连续 {self.consecutive_rejects} 次)"
+            )
+            self.last_trade_time = time.time()
             return
         elif fill_status == "timeout":
-            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id}")
+            self.consecutive_rejects += 1
+            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id[-8:]}")
             await self.paradex.cancel_order(order_id)
             self.last_trade_time = time.time()
             return
+
+        # 成交了，重置拒绝计数
+        self.consecutive_rejects = 0
 
         logger.info(f"[Paradex] 买单成交: {self.size} @ {order_price}")
 
@@ -468,7 +491,22 @@ class ArbitrageEngine:
         # 1. Paradex 挂 POST_ONLY 卖单 (maker)
         p_info = await self.paradex.get_market_info(self.paradex_market)
         tick = p_info.tick_size if p_info else Decimal("0.1")
+
+        # 价差宽度检查: 至少 2 ticks 才能安全放 POST_ONLY
+        spread_width = p_bbo.ask - p_bbo.bid
+        if spread_width <= tick:
+            logger.debug(f"Paradex 价差过窄 ({spread_width}), POST_ONLY 易被拒，跳过")
+            return
+
         order_price = p_bbo.bid + tick
+
+        # 连续拒绝退避
+        if self.consecutive_rejects >= 3:
+            backoff = min(self.consecutive_rejects * 5, 30)
+            logger.info(f"连续 {self.consecutive_rejects} 次被拒，退避 {backoff}s")
+            self.last_trade_time = time.time() + backoff - self.trade_cooldown
+            self.consecutive_rejects = 0
+            return
 
         logger.info(f"[Paradex] 挂卖单: {self.size} @ {order_price} (POST_ONLY)")
 
@@ -490,14 +528,22 @@ class ArbitrageEngine:
         fill_status = await self._wait_for_fill(order_id)
 
         if fill_status == "rejected":
-            logger.info(f"[Paradex] POST_ONLY 订单被拒 (穿越价差): {order_id}")
+            self.consecutive_rejects += 1
+            logger.info(
+                f"[Paradex] POST_ONLY 被拒 (穿越价差): {order_id[-8:]} "
+                f"(连续 {self.consecutive_rejects} 次)"
+            )
             self.last_trade_time = time.time()
             return
         elif fill_status == "timeout":
-            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id}")
+            self.consecutive_rejects += 1
+            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id[-8:]}")
             await self.paradex.cancel_order(order_id)
             self.last_trade_time = time.time()
             return
+
+        # 成交了，重置拒绝计数
+        self.consecutive_rejects = 0
 
         logger.info(f"[Paradex] 卖单成交: {self.size} @ {order_price}")
 
@@ -557,6 +603,7 @@ class ArbitrageEngine:
             if info:
                 status = info.get("status", "")
                 remaining = Decimal(info.get("remaining_size", "1"))
+                logger.debug(f"订单状态: {order_id[-8:]} status={status} remaining={remaining}")
 
                 if status == "CLOSED" and remaining == 0:
                     return "filled"
@@ -567,6 +614,21 @@ class ArbitrageEngine:
                     return "timeout"  # 等了一会儿后被取消
                 elif status == "OPEN" and remaining == 0:
                     return "filled"
+            else:
+                # 订单未找到 — 可能被 Paradex 秒拒并清除
+                if first_check:
+                    await asyncio.sleep(0.5)
+                    info2 = await self.paradex.get_order_info(order_id)
+                    if info2 is None:
+                        logger.debug(f"订单 {order_id[-8:]} 查询不到，判定为被拒")
+                        return "rejected"
+                    # 第二次查到了，继续正常处理
+                    status = info2.get("status", "")
+                    remaining = Decimal(info2.get("remaining_size", "1"))
+                    if status == "CLOSED" and remaining == 0:
+                        return "filled"
+                    elif status == "CLOSED":
+                        return "rejected"
 
             first_check = False
             await asyncio.sleep(0.3)

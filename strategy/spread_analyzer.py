@@ -129,7 +129,11 @@ class SpreadAnalyzer:
 
         # 检查做多信号: Variational_bid - Paradex_ask > mean + threshold
         # 含义: Paradex 买入（做多）便宜，Variational 卖出（做空）价格高
-        if self.current_long_spread > self.long_mean + self.long_threshold:
+        # 附加条件: 价差必须为正 (名义盈利) 且偏离均值超过阈值
+        if (
+            self.current_long_spread > self.long_mean + self.long_threshold
+            and self.current_long_spread > 0
+        ):
             return SpreadSignal(
                 direction="LONG",
                 spread=self.current_long_spread,
@@ -139,7 +143,10 @@ class SpreadAnalyzer:
 
         # 检查做空信号: Paradex_bid - Variational_ask > mean + threshold
         # 含义: Paradex 卖出（做空）价格高，Variational 买入（做多）便宜
-        if self.current_short_spread > self.short_mean + self.short_threshold:
+        if (
+            self.current_short_spread > self.short_mean + self.short_threshold
+            and self.current_short_spread > 0
+        ):
             return SpreadSignal(
                 direction="SHORT",
                 spread=self.current_short_spread,
