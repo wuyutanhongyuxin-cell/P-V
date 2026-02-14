@@ -87,7 +87,9 @@ class ArbitrageEngine:
         self.start_time = time.time()
         self.last_balance_report_time = time.time()
         self.last_trade_time: float = 0
+        self.last_heartbeat_time: float = 0  # 上次心跳时间
         self.trade_cooldown: float = 3.0  # 交易后冷却 3 秒
+        self.heartbeat_interval: float = 300.0  # 心跳间隔 5 分钟
 
         # BBO 失败计数器
         self._bbo_fail_count = 0
@@ -336,6 +338,9 @@ class ArbitrageEngine:
                 # 5. 定期检查余额和仓位
                 await self._periodic_checks()
 
+                # 6. 定期打印心跳日志（让用户知道脚本还活着）
+                self._print_heartbeat_if_needed(p_bbo, v_bbo)
+
                 # 等待下一轮 (1秒间隔，匹配价差采样频率)
                 await asyncio.sleep(1.0)
 
@@ -370,6 +375,63 @@ class ArbitrageEngine:
         except Exception as e:
             logger.error(f"获取 BBO 异常: {e}")
             return None, None
+
+    def _print_heartbeat_if_needed(self, p_bbo, v_bbo) -> None:
+        """
+        定期打印心跳日志（5分钟一次）
+        让用户知道脚本还在运行，并显示当前状态
+        """
+        now = time.time()
+        if now - self.last_heartbeat_time < self.heartbeat_interval:
+            return
+
+        self.last_heartbeat_time = now
+
+        # 只有预热完成后才打印心跳
+        if not self.spread_analyzer.is_warmed_up:
+            return
+
+        # 如果 BBO 获取失败，不打印心跳（避免干扰错误日志）
+        if not p_bbo or not v_bbo:
+            return
+
+        # 运行时长
+        runtime_hours = (now - self.start_time) / 3600
+
+        # 当前价差
+        long_spread = self.spread_analyzer.current_long_spread
+        short_spread = self.spread_analyzer.current_short_spread
+
+        # 距离触发线还差多少
+        long_trigger = max(
+            self.spread_analyzer.long_mean + self.spread_analyzer.long_threshold,
+            self.spread_analyzer.min_spread,
+        )
+        short_trigger = max(
+            self.spread_analyzer.short_mean + self.spread_analyzer.short_threshold,
+            self.spread_analyzer.min_spread,
+        )
+        long_gap = long_trigger - long_spread
+        short_gap = short_trigger - short_spread
+
+        logger.info("=" * 60)
+        logger.info(
+            f"💓 心跳 | 运行 {runtime_hours:.1f}h | 交易 {self.trade_count} 笔 | "
+            f"监控周期 {self.spread_analyzer.sample_count}"
+        )
+        logger.info(
+            f"📊 做多价差: {long_spread:.2f} | 触发线: {long_trigger:.2f} | "
+            f"还差: {long_gap:.2f} {'✅' if long_gap <= 0 else ''}"
+        )
+        logger.info(
+            f"📊 做空价差: {short_spread:.2f} | 触发线: {short_trigger:.2f} | "
+            f"还差: {short_gap:.2f} {'✅' if short_gap <= 0 else ''}"
+        )
+        logger.info(
+            f"💰 仓位: Paradex={self.position_tracker.paradex_position:+.6f} | "
+            f"Variational={self.position_tracker.variational_position:+.6f}"
+        )
+        logger.info("=" * 60)
 
     # ========== 交易执行 ==========
 
