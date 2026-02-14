@@ -1,6 +1,6 @@
 # Paradex × Variational 跨所永续合约价差套利机器人
 
-> **双边零手续费**套利策略 — Paradex (Interactive Token maker 0费) + Variational (taker 0费)
+> **双边零手续费**套利策略 — Paradex (Interactive Token taker 0费) + Variational (taker 0费)
 
 ```
 利润 = 纯价差收益，无需扣除任何手续费
@@ -78,13 +78,12 @@
     │
     ▼
 ┌─────────────────────────────┐
-│ 1. Paradex 挂 POST_ONLY 单  │  ← maker, Interactive Token 零手续费
-│    (best_ask - tick_size)    │
+│ 1. Paradex 直接吃单          │  ← taker, Interactive Token 零手续费
+│    BUY@ask / SELL@bid        │     秒成交，无需等待
 └──────────────┬──────────────┘
-               │
-    ▼ 等待成交 (超时自动取消)
-               │
-┌──────────────┴──────────────┐
+               │ 确认成交
+               ▼
+┌─────────────────────────────┐
 │ 2. Variational 市价对冲      │  ← taker, 零手续费
 │    (RFQ: 获取报价 → 提交)    │
 └─────────────────────────────┘
@@ -92,9 +91,9 @@
     ▼ 仓位更新，等待下一个信号
 ```
 
-### 为什么 Paradex 用 maker、Variational 用 taker？
+### 为什么两边都用 taker？
 
-- **Paradex**: POST_ONLY 限价单确保 maker 身份，配合 Interactive Token 实现零手续费
+- **Paradex**: Interactive Token 下 **maker 和 taker 都是零手续费**，直接吃单秒成交，避免挂单超时
 - **Variational**: 本身所有订单都零手续费，市价单保证成交速度
 
 ---
@@ -281,6 +280,54 @@ ACCOUNT_LABEL=A1                # 账号标签
 python main.py --ticker BTC --size 0.001 --max-position 0.01
 ```
 
+### 使用 screen 后台运行 (推荐)
+
+在 Linux 服务器上建议使用 `screen` 保持程序在后台运行，断开 SSH 后不会中断：
+
+```bash
+# 1. 创建一个新的 screen 会话（命名为 arb）
+screen -S arb
+
+# 2. 在 screen 内启动机器人
+cd /path/to/P-V
+python main.py --ticker BTC --size 0.001 --max-position 0.01
+
+# 3. 分离 screen（程序继续在后台运行）
+#    快捷键: Ctrl+A 然后按 D
+
+# 4. 重新连接到 screen（查看运行状态）
+screen -r arb
+
+# 5. 查看所有 screen 会话
+screen -ls
+```
+
+#### 多交易对同时运行
+
+```bash
+# 为每个交易对创建单独的 screen
+screen -S arb-btc
+python main.py --ticker BTC --size 0.001 --max-position 0.01
+# Ctrl+A, D 分离
+
+screen -S arb-eth
+python main.py --ticker ETH --size 0.01 --max-position 0.1
+# Ctrl+A, D 分离
+```
+
+#### 停止机器人
+
+```bash
+# 重新连接到 screen
+screen -r arb
+
+# 按 Ctrl+C 触发优雅退出（自动平仓）
+# 等待平仓完成后 screen 会话自动结束
+
+# 或强制关闭 screen 会话（不推荐，不会平仓）
+screen -X -S arb quit
+```
+
 ### 完整参数
 
 ```bash
@@ -305,7 +352,7 @@ python main.py \
 | `--max-position` | Decimal | **必填** | 最大持仓限制 (单边绝对值) |
 | `--long-threshold` | Decimal | 10 | 做多触发: 价差 > 均值 + 此值 |
 | `--short-threshold` | Decimal | 10 | 做空触发: 价差 > 均值 + 此值 |
-| `--fill-timeout` | int | 5 | 限价单成交超时 (秒) |
+| `--fill-timeout` | int | 5 | 吃单成交确认超时 (秒) |
 | `--min-balance` | Decimal | 10 | 最低余额 (USDC)，低于此值平仓退出 |
 | `--warmup-samples` | int | 100 | 预热采样数量 |
 | `--env-file` | str | .env | 环境变量文件路径 |
@@ -510,7 +557,7 @@ async with AsyncSession(impersonate="chrome131") as session:
 | **最大持仓限制** | 单边持仓不超过 `--max-position` |
 | **余额不足退出** | 任一交易所余额 < `--min-balance` 时自动平仓退出 |
 | **仓位不平衡检测** | 每 30 分钟检查，净仓位 > 2倍单笔时报警 |
-| **订单超时取消** | Paradex 限价单超时 (默认 5s) 未成交自动取消 |
+| **订单超时取消** | Paradex 吃单超时 (默认 5s) 未成交自动取消 |
 | **优雅退出** | Ctrl+C 触发: 取消挂单 → 市价平仓 → 确认仓位归零 |
 | **Telegram 报警** | 对冲失败、仓位不平衡等异常发送即时通知 |
 
@@ -526,7 +573,7 @@ async with AsyncSession(impersonate="chrome131") as session:
    - 缓解: curl_cffi TLS 指纹模拟，检测 403 状态
 
 4. **价格剧烈波动**: 极端行情下价差可能瞬间消失
-   - 缓解: POST_ONLY 保证 maker 身份，超时取消未成交单
+   - 缓解: 直接 taker 秒成交锁定价差，3 秒冷却防止连续亏损
 
 ---
 
@@ -582,7 +629,7 @@ vr-token 已过期 (通常 7 天有效)，需要：
 ### Q: Paradex 认证失败？
 
 1. 检查 L2 私钥和地址是否正确
-2. 确认 `paradex-py` 已安装且版本 >= 2.0
+2. 确认 `paradex-py` 已安装且版本 >= 0.5
 3. 检查网络是否能访问 `api.prod.paradex.trade`
 
 ### Q: 长时间没有交易？
@@ -604,13 +651,16 @@ python main.py --ticker BTC --size 0.001 --max-position 0.01
 
 ### Q: 如何同时套利多个交易对？
 
-打开多个终端窗口，每个运行不同 ticker：
+使用 `screen` 为每个交易对创建独立会话（参见[使用方法](#使用-screen-后台运行-推荐)）：
 ```bash
-# 终端 1
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+screen -S arb-btc -dm python main.py --ticker BTC --size 0.001 --max-position 0.01
+screen -S arb-eth -dm python main.py --ticker ETH --size 0.01 --max-position 0.1
 
-# 终端 2
-python main.py --ticker ETH --size 0.01 --max-position 0.1
+# 查看所有会话
+screen -ls
+
+# 连接到某个会话查看日志
+screen -r arb-btc
 ```
 
 ---
