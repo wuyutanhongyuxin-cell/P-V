@@ -269,13 +269,19 @@ class ArbitrageEngine:
 
                 if not p_bbo or not v_bbo:
                     self._bbo_fail_count += 1
-                    # 每 10 次失败打印一次 WARNING，避免刷屏
-                    if self._bbo_fail_count % 10 == 1:
-                        fail_reason = []
-                        if not p_bbo:
-                            fail_reason.append("Paradex")
-                        if not v_bbo:
-                            fail_reason.append("Variational")
+                    fail_reason = []
+                    if not p_bbo:
+                        fail_reason.append("Paradex")
+                    if not v_bbo:
+                        fail_reason.append("Variational")
+
+                    # 预热阶段每次都打印，预热后每 10 次打印一次
+                    if not self.spread_analyzer.is_warmed_up:
+                        logger.warning(
+                            f"[预热中] BBO 获取失败 ({' & '.join(fail_reason)})，"
+                            f"已失败 {self._bbo_fail_count} 次，等待重试..."
+                        )
+                    elif self._bbo_fail_count % 10 == 1:
                         logger.warning(
                             f"BBO 获取失败 ({' & '.join(fail_reason)})，"
                             f"已连续失败 {self._bbo_fail_count} 次，等待重试..."
