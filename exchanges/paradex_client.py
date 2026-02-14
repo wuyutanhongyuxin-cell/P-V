@@ -322,54 +322,40 @@ class ParadexInteractiveClient(BaseExchangeClient):
         size: Decimal,
         reduce_only: bool = False,
     ) -> OrderResult:
-        """下市价单（主要用于平仓）"""
+        """
+        下市价单（主要用于平仓）
+        实现: 使用激进限价单模拟市价单
+        原因: Paradex MARKET 类型订单存在 size 序列化兼容问题，
+              用 GTC 限价单以偏离市价 0.5% 的价格下单，确保立即成交
+        """
         try:
             if not await self.ensure_authenticated():
                 return OrderResult(success=False, error_message="认证失败")
 
-            from paradex_py.common.order import Order, OrderSide, OrderType
+            # 获取当前 BBO 计算激进价格
+            bbo = await self.get_bbo(market)
+            if not bbo:
+                return OrderResult(success=False, error_message="无法获取 BBO")
 
-            order_side = OrderSide.Buy if side.upper() == "BUY" else OrderSide.Sell
+            # 激进定价: 偏离市价 0.5% 确保立即成交
+            if side.upper() == "BUY":
+                aggressive_price = bbo.ask * Decimal("1.005")
+            else:
+                aggressive_price = bbo.bid * Decimal("0.995")
 
-            # 对齐数量精度
-            market_info = await self.get_market_info(market)
-            if market_info:
-                size = self.round_size(size, market_info.step_size)
-
-            order = Order(
-                market=market,
-                order_type=OrderType.Market,
-                order_side=order_side,
-                size=size,
-                client_id=f"arb_mkt_{int(time.time() * 1000)}",
-                reduce_only=reduce_only,
-                signature_timestamp=int(time.time() * 1000),
+            logger.info(
+                f"Paradex 市价单(激进限价): {side} {size} @ {aggressive_price:.2f} "
+                f"(BBO: {bbo.bid}/{bbo.ask})"
             )
 
-            order.signature = self.paradex.account.sign_order(order)
-
-            session = await self._get_session()
-            url = f"{self.base_url}/orders"
-            payload = order.dump_to_dict()
-
-            async with session.post(
-                url, headers=self._get_auth_headers(), json=payload
-            ) as resp:
-                if resp.status == 201:
-                    result = await resp.json()
-                    return OrderResult(
-                        success=True,
-                        order_id=result.get("id", ""),
-                        side=side.upper(),
-                        size=size,
-                        status=result.get("status", "NEW"),
-                    )
-                else:
-                    error = await resp.text()
-                    logger.error(f"Paradex 市价单失败: {resp.status} - {error}")
-                    return OrderResult(
-                        success=False, error_message=f"{resp.status}: {error}"
-                    )
+            return await self.place_limit_order(
+                market=market,
+                side=side,
+                size=size,
+                price=aggressive_price,
+                post_only=False,
+                reduce_only=reduce_only,
+            )
 
         except Exception as e:
             logger.error(f"Paradex 市价单异常: {e}")
