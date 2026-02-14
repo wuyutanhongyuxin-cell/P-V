@@ -459,7 +459,7 @@ class ParadexInteractiveClient(BaseExchangeClient):
                             continue
                         if p.get("status") == "CLOSED":
                             continue
-                        size = Decimal(p.get("size", "0"))
+                        size = abs(Decimal(p.get("size", "0")))
                         if size == 0:
                             continue
                         positions.append(
