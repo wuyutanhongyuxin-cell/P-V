@@ -47,11 +47,13 @@ class SpreadAnalyzer:
         self,
         long_threshold: Decimal = Decimal("10"),
         short_threshold: Decimal = Decimal("10"),
+        min_spread: Decimal = Decimal("5"),
         warmup_samples: int = 100,
         window_size: int = 500,
     ):
         self.long_threshold = long_threshold
         self.short_threshold = short_threshold
+        self.min_spread = min_spread  # 绝对最低价差，防止 mean 为负时阈值过低
         self.warmup_samples = warmup_samples
 
         # 滑动窗口 — 用于计算滚动均值
@@ -127,13 +129,13 @@ class SpreadAnalyzer:
         if not self.is_warmed_up:
             return None
 
-        # 检查做多信号: Variational_bid - Paradex_ask > mean + threshold
-        # 含义: Paradex 买入（做多）便宜，Variational 卖出（做空）价格高
-        # 附加条件: 价差必须为正 (名义盈利) 且偏离均值超过阈值
-        if (
-            self.current_long_spread > self.long_mean + self.long_threshold
-            and self.current_long_spread > 0
-        ):
+        # 触发条件: spread > max(mean + threshold, min_spread)
+        # max() 确保即使 mean 深度为负，也不会用过低的阈值触发
+        # 例: mean=-12, threshold=10 → max(-2, 5) = 5，而非 -2
+
+        # 检查做多信号: Variational_bid - Paradex_ask
+        long_trigger = max(self.long_mean + self.long_threshold, self.min_spread)
+        if self.current_long_spread > long_trigger:
             return SpreadSignal(
                 direction="LONG",
                 spread=self.current_long_spread,
@@ -141,12 +143,9 @@ class SpreadAnalyzer:
                 threshold=self.long_threshold,
             )
 
-        # 检查做空信号: Paradex_bid - Variational_ask > mean + threshold
-        # 含义: Paradex 卖出（做空）价格高，Variational 买入（做多）便宜
-        if (
-            self.current_short_spread > self.short_mean + self.short_threshold
-            and self.current_short_spread > 0
-        ):
+        # 检查做空信号: Paradex_bid - Variational_ask
+        short_trigger = max(self.short_mean + self.short_threshold, self.min_spread)
+        if self.current_short_spread > short_trigger:
             return SpreadSignal(
                 direction="SHORT",
                 spread=self.current_short_spread,

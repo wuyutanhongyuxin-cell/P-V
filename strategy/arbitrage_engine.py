@@ -49,6 +49,7 @@ class ArbitrageEngine:
         max_position: Decimal,
         long_threshold: Decimal = Decimal("10"),
         short_threshold: Decimal = Decimal("10"),
+        min_spread: Decimal = Decimal("5"),
         fill_timeout: int = 5,
         min_balance: Decimal = Decimal("10"),
         warmup_samples: int = 100,
@@ -67,6 +68,7 @@ class ArbitrageEngine:
         self.spread_analyzer = SpreadAnalyzer(
             long_threshold=long_threshold,
             short_threshold=short_threshold,
+            min_spread=min_spread,
             warmup_samples=warmup_samples,
         )
         self.position_tracker = PositionTracker(max_position=max_position)
@@ -291,6 +293,15 @@ class ArbitrageEngine:
                     # 冷却检查: 上次交易后等待 N 秒
                     if time.time() - self.last_trade_time < self.trade_cooldown:
                         pass  # 冷却中，跳过
+                    elif self.paradex.should_pause_trading:
+                        # Interactive 限速保护: 暂停开仓
+                        rate_info = self.paradex.get_rate_info()
+                        logger.warning(
+                            f"[限速暂停] 跳过交易 | "
+                            f"1h={rate_info['orders_1h']}/200 "
+                            f"24h={rate_info['orders_24h']}/1000 "
+                            f"interactive_lost={rate_info['interactive_lost']}"
+                        )
                     elif signal_result.direction == "LONG" and self.position_tracker.can_open_long(self.size):
                         await self._execute_long_trade(p_bbo, v_bbo, signal_result)
                     elif signal_result.direction == "SHORT" and self.position_tracker.can_open_short(self.size):
@@ -312,10 +323,12 @@ class ArbitrageEngine:
     # ========== 数据获取 ==========
 
     async def _fetch_both_bbo(self) -> tuple:
-        """同时获取两边的 BBO"""
+        """同时获取两边的 BBO (Variational 使用 RFQ 实时报价)"""
         try:
             p_task = asyncio.create_task(self.paradex.get_bbo(self.paradex_market))
-            v_task = asyncio.create_task(self.variational.get_bbo(self.variational_market))
+            v_task = asyncio.create_task(
+                self.variational.get_bbo(self.variational_market, size=self.size)
+            )
 
             p_bbo, v_bbo = await asyncio.gather(p_task, v_task, return_exceptions=True)
 
@@ -338,9 +351,8 @@ class ArbitrageEngine:
         self, p_bbo: BBO, v_bbo: BBO, signal: SpreadSignal
     ) -> None:
         """
-        执行做多套利 (taker 模式, interactive token 零手续费):
-          1. Paradex 直接吃单买入 (taker, 秒成交)
-          2. Variational 市价卖出对冲
+        执行做多套利 — 双腿同时下单:
+          Paradex BUY (taker) + Variational SELL (market) 同时发送
         """
         if self.stop_flag:
             return
@@ -358,51 +370,45 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做多")
             return
 
-        # 1. Paradex 直接吃单买入 (taker, 以 ask 价格成交)
         order_price = p_bbo.ask
 
-        logger.info(f"[Paradex] 吃单买入: {self.size} @ {order_price}")
+        logger.info(
+            f"[同时下单] Paradex BUY {self.size} @ {order_price} | "
+            f"Variational SELL {self.size}"
+        )
 
-        result = await self.paradex.place_limit_order(
+        # 双腿同时发送
+        p_coro = self.paradex.place_limit_order(
             market=self.paradex_market,
             side="BUY",
             size=self.size,
             price=order_price,
             post_only=False,
         )
-
-        if not result.success:
-            logger.warning(f"[Paradex] 下单失败: {result.error_message}")
-            self.last_trade_time = time.time()
-            return
-
-        order_id = result.order_id
-
-        # 确认成交 (taker 应秒成交，短超时即可)
-        fill_status = await self._wait_for_fill(order_id)
-
-        if fill_status != "filled":
-            logger.warning(f"[Paradex] 吃单未成交 ({fill_status})，取消: {order_id[-8:]}")
-            await self.paradex.cancel_order(order_id)
-            self.last_trade_time = time.time()
-            return
-
-        logger.info(f"[Paradex] 买入成交: {self.size} @ {order_price}")
-
-        # 2. Variational 市价卖出对冲
-        logger.info(f"[Variational] 市价卖出对冲: {self.size}")
-
-        hedge_result = await self.variational.place_market_order(
+        v_coro = self.variational.place_market_order(
             market=self.variational_market,
             side="SELL",
             size=self.size,
         )
 
+        results = await asyncio.gather(p_coro, v_coro, return_exceptions=True)
+        p_result, v_result = results
+
         self.last_trade_time = time.time()
 
-        if hedge_result.success:
-            logger.info(f"[Variational] 对冲成功: {hedge_result.order_id}")
+        p_ok = isinstance(p_result, OrderResult) and p_result.success
+        v_ok = isinstance(v_result, OrderResult) and v_result.success
+
+        p_err = p_result.error_message if isinstance(p_result, OrderResult) else str(p_result)
+        v_err = v_result.error_message if isinstance(v_result, OrderResult) else str(v_result)
+
+        if p_ok and v_ok:
+            # 两边都成功
             self.trade_count += 1
+            logger.info(
+                f"[做多成交] #{self.trade_count} Paradex BUY {self.size} @ {order_price} | "
+                f"Variational SELL {self.size}"
+            )
 
             self.data_logger.log_trade(
                 direction="LONG",
@@ -421,25 +427,43 @@ class ArbitrageEngine:
                     f"Variational SELL {self.size}\n"
                     f"价差: {signal.spread:.4f}"
                 )
-        else:
+
+        elif p_ok and not v_ok:
+            # Paradex 成功, Variational 失败 — 反向平仓 Paradex
             logger.error(
-                f"[Variational] 对冲失败! {hedge_result.error_message}\n"
-                "警告: Paradex 已成交但 Variational 未对冲，仓位不平衡!"
+                f"[单腿失败] Variational SELL 失败: {v_err}\n"
+                "反向平仓 Paradex..."
             )
+            await self.paradex.close_position(self.paradex_market)
             if self.telegram:
                 self.telegram.send(
-                    f"对冲失败! 仓位可能不平衡\n"
-                    f"Paradex BUY 已成交但 Variational SELL 失败\n"
-                    f"错误: {hedge_result.error_message}"
+                    f"单腿失败! Variational SELL 失败\n"
+                    f"已反向平仓 Paradex\n错误: {v_err}"
                 )
+
+        elif not p_ok and v_ok:
+            # Variational 成功, Paradex 失败 — 反向平仓 Variational
+            logger.error(
+                f"[单腿失败] Paradex BUY 失败: {p_err}\n"
+                "反向平仓 Variational..."
+            )
+            await self.variational.close_position(self.variational_market)
+            if self.telegram:
+                self.telegram.send(
+                    f"单腿失败! Paradex BUY 失败\n"
+                    f"已反向平仓 Variational\n错误: {p_err}"
+                )
+
+        else:
+            # 两边都失败
+            logger.warning(f"[两边失败] Paradex: {p_err} | Variational: {v_err}")
 
     async def _execute_short_trade(
         self, p_bbo: BBO, v_bbo: BBO, signal: SpreadSignal
     ) -> None:
         """
-        执行做空套利 (taker 模式, interactive token 零手续费):
-          1. Paradex 直接吃单卖出 (taker, 秒成交)
-          2. Variational 市价买入对冲
+        执行做空套利 — 双腿同时下单:
+          Paradex SELL (taker) + Variational BUY (market) 同时发送
         """
         if self.stop_flag:
             return
@@ -456,51 +480,45 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做空")
             return
 
-        # 1. Paradex 直接吃单卖出 (taker, 以 bid 价格成交)
         order_price = p_bbo.bid
 
-        logger.info(f"[Paradex] 吃单卖出: {self.size} @ {order_price}")
+        logger.info(
+            f"[同时下单] Paradex SELL {self.size} @ {order_price} | "
+            f"Variational BUY {self.size}"
+        )
 
-        result = await self.paradex.place_limit_order(
+        # 双腿同时发送
+        p_coro = self.paradex.place_limit_order(
             market=self.paradex_market,
             side="SELL",
             size=self.size,
             price=order_price,
             post_only=False,
         )
-
-        if not result.success:
-            logger.warning(f"[Paradex] 下单失败: {result.error_message}")
-            self.last_trade_time = time.time()
-            return
-
-        order_id = result.order_id
-
-        # 确认成交 (taker 应秒成交)
-        fill_status = await self._wait_for_fill(order_id)
-
-        if fill_status != "filled":
-            logger.warning(f"[Paradex] 吃单未成交 ({fill_status})，取消: {order_id[-8:]}")
-            await self.paradex.cancel_order(order_id)
-            self.last_trade_time = time.time()
-            return
-
-        logger.info(f"[Paradex] 卖出成交: {self.size} @ {order_price}")
-
-        # 2. Variational 市价买入对冲
-        logger.info(f"[Variational] 市价买入对冲: {self.size}")
-
-        hedge_result = await self.variational.place_market_order(
+        v_coro = self.variational.place_market_order(
             market=self.variational_market,
             side="BUY",
             size=self.size,
         )
 
+        results = await asyncio.gather(p_coro, v_coro, return_exceptions=True)
+        p_result, v_result = results
+
         self.last_trade_time = time.time()
 
-        if hedge_result.success:
-            logger.info(f"[Variational] 对冲成功: {hedge_result.order_id}")
+        p_ok = isinstance(p_result, OrderResult) and p_result.success
+        v_ok = isinstance(v_result, OrderResult) and v_result.success
+
+        p_err = p_result.error_message if isinstance(p_result, OrderResult) else str(p_result)
+        v_err = v_result.error_message if isinstance(v_result, OrderResult) else str(v_result)
+
+        if p_ok and v_ok:
+            # 两边都成功
             self.trade_count += 1
+            logger.info(
+                f"[做空成交] #{self.trade_count} Paradex SELL {self.size} @ {order_price} | "
+                f"Variational BUY {self.size}"
+            )
 
             self.data_logger.log_trade(
                 direction="SHORT",
@@ -519,17 +537,36 @@ class ArbitrageEngine:
                     f"Variational BUY {self.size}\n"
                     f"价差: {signal.spread:.4f}"
                 )
-        else:
+
+        elif p_ok and not v_ok:
+            # Paradex 成功, Variational 失败 — 反向平仓 Paradex
             logger.error(
-                f"[Variational] 对冲失败! {hedge_result.error_message}\n"
-                "警告: Paradex 已成交但 Variational 未对冲，仓位不平衡!"
+                f"[单腿失败] Variational BUY 失败: {v_err}\n"
+                "反向平仓 Paradex..."
             )
+            await self.paradex.close_position(self.paradex_market)
             if self.telegram:
                 self.telegram.send(
-                    f"对冲失败! 仓位可能不平衡\n"
-                    f"Paradex SELL 已成交但 Variational BUY 失败\n"
-                    f"错误: {hedge_result.error_message}"
+                    f"单腿失败! Variational BUY 失败\n"
+                    f"已反向平仓 Paradex\n错误: {v_err}"
                 )
+
+        elif not p_ok and v_ok:
+            # Variational 成功, Paradex 失败 — 反向平仓 Variational
+            logger.error(
+                f"[单腿失败] Paradex SELL 失败: {p_err}\n"
+                "反向平仓 Variational..."
+            )
+            await self.variational.close_position(self.variational_market)
+            if self.telegram:
+                self.telegram.send(
+                    f"单腿失败! Paradex SELL 失败\n"
+                    f"已反向平仓 Variational\n错误: {p_err}"
+                )
+
+        else:
+            # 两边都失败
+            logger.warning(f"[两边失败] Paradex: {p_err} | Variational: {v_err}")
 
     async def _wait_for_fill(self, order_id: str) -> str:
         """
@@ -619,6 +656,14 @@ class ArbitrageEngine:
             await self._refresh_positions()
             self.position_tracker.check_imbalance(threshold=self.size * 2)
 
+            # 限速状态日志
+            rate_info = self.paradex.get_rate_info()
+            logger.info(
+                f"[限速状态] 1h={rate_info['orders_1h']}/200 "
+                f"24h={rate_info['orders_24h']}/1000 "
+                f"paused={rate_info['paused']}"
+            )
+
             if self.telegram:
                 status = self.spread_analyzer.get_status()
                 pos = self.position_tracker.get_status()
@@ -627,5 +672,6 @@ class ArbitrageEngine:
                     f"余额: P={p_bal}, V={v_bal}\n"
                     f"仓位: P={pos['paradex']}, V={pos['variational']}\n"
                     f"交易次数: {self.trade_count}\n"
-                    f"价差均值: L={status['long_mean']:.2f}, S={status['short_mean']:.2f}"
+                    f"价差均值: L={status['long_mean']:.2f}, S={status['short_mean']:.2f}\n"
+                    f"限速: {rate_info['orders_1h']}/200h {rate_info['orders_24h']}/1000d"
                 )

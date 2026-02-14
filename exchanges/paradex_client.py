@@ -8,6 +8,7 @@ import base64
 import json
 import logging
 import time
+from collections import deque
 from decimal import Decimal, ROUND_DOWN
 from typing import Any, Dict, List, Optional
 
@@ -50,6 +51,12 @@ class ParadexInteractiveClient(BaseExchangeClient):
 
         # aiohttp session（复用连接）
         self._session: Optional[aiohttp.ClientSession] = None
+
+        # Interactive 限速保护 (200单/小时, 1000单/天)
+        self._order_timestamps: deque = deque()  # 所有订单时间戳
+        self._interactive_lost: bool = False  # INTERACTIVE 标志丢失
+        self._interactive_lost_time: float = 0  # 丢失时间
+        self._interactive_pause_duration: float = 600  # 暂停 10 分钟
 
         # 初始化 paradex-py SDK
         self._init_sdk()
@@ -155,6 +162,61 @@ class ParadexInteractiveClient(BaseExchangeClient):
         return {
             "Authorization": f"Bearer {self.jwt_token}",
             "Content-Type": "application/json",
+        }
+
+    # ========== Interactive 限速保护 ==========
+
+    def _clean_old_timestamps(self) -> None:
+        """清理超过 24 小时的订单时间戳"""
+        cutoff = time.time() - 86400
+        while self._order_timestamps and self._order_timestamps[0] < cutoff:
+            self._order_timestamps.popleft()
+
+    @property
+    def orders_last_hour(self) -> int:
+        """过去 1 小时的订单数"""
+        cutoff = time.time() - 3600
+        return sum(1 for t in self._order_timestamps if t > cutoff)
+
+    @property
+    def orders_last_day(self) -> int:
+        """过去 24 小时的订单数"""
+        self._clean_old_timestamps()
+        return len(self._order_timestamps)
+
+    @property
+    def should_pause_trading(self) -> bool:
+        """
+        是否应暂停开仓:
+        1. INTERACTIVE 标志丢失 → 暂停 10 分钟等恢复
+        2. 接近限速阈值 (小时 >=180 或 日 >=900) → 主动减速
+        """
+        # 检查 INTERACTIVE 丢失
+        if self._interactive_lost:
+            elapsed = time.time() - self._interactive_lost_time
+            if elapsed < self._interactive_pause_duration:
+                return True
+            # 暂停期过后自动重试
+            self._interactive_lost = False
+            logger.info("INTERACTIVE 暂停期结束，恢复交易")
+
+        # 主动限速: 预留 10% 安全余量
+        if self.orders_last_hour >= 180:
+            logger.warning(f"接近小时限速: {self.orders_last_hour}/200")
+            return True
+        if self.orders_last_day >= 900:
+            logger.warning(f"接近日限速: {self.orders_last_day}/1000")
+            return True
+
+        return False
+
+    def get_rate_info(self) -> Dict[str, Any]:
+        """获取限速状态 (用于日志/监控)"""
+        return {
+            "orders_1h": self.orders_last_hour,
+            "orders_24h": self.orders_last_day,
+            "interactive_lost": self._interactive_lost,
+            "paused": self.should_pause_trading,
         }
 
     # ========== 市场数据 ==========
@@ -288,12 +350,23 @@ class ParadexInteractiveClient(BaseExchangeClient):
                     order_id = result.get("id", "")
                     flags = result.get("flags", [])
 
+                    # 记录订单时间用于限速统计
+                    self._order_timestamps.append(time.time())
+
                     if "INTERACTIVE" in flags:
                         logger.debug(f"订单 {order_id} 确认 INTERACTIVE 模式 (0手续费)")
+                        # INTERACTIVE 恢复时重置暂停
+                        if self._interactive_lost:
+                            logger.info("INTERACTIVE 模式已恢复!")
+                            self._interactive_lost = False
                     else:
                         logger.warning(
-                            f"订单 {order_id} flags={flags}, 可能不是 interactive"
+                            f"订单 {order_id} flags={flags}, INTERACTIVE 丢失! "
+                            f"可能已达限速 (200/h 或 1000/d)"
                         )
+                        if not self._interactive_lost:
+                            self._interactive_lost = True
+                            self._interactive_lost_time = time.time()
 
                     return OrderResult(
                         success=True,

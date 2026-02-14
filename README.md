@@ -74,20 +74,26 @@
 ### 执行流程
 
 ```
-检测到价差信号
+检测到价差信号 (spread > max(均值+阈值, 最低价差))
+    │
+    ├── 检查 Interactive 限速 (200/h, 1000/d)
+    │   └── 超限 → 暂停开仓
     │
     ▼
-┌─────────────────────────────┐
-│ 1. Paradex 直接吃单          │  ← taker, Interactive Token 零手续费
-│    BUY@ask / SELL@bid        │     秒成交，无需等待
-└──────────────┬──────────────┘
-               │ 确认成交
-               ▼
-┌─────────────────────────────┐
-│ 2. Variational 市价对冲      │  ← taker, 零手续费
-│    (RFQ: 获取报价 → 提交)    │
-└─────────────────────────────┘
-               │
+┌──────────────────────────────────────────────┐
+│         asyncio.gather 同时发送两腿           │
+│                                              │
+│  Paradex 吃单 (taker)    Variational 市价单   │
+│  BUY@ask / SELL@bid      RFQ → 市价提交       │
+│  Interactive Token 0费    taker 0费            │
+└──────────────────┬───────────────────────────┘
+                   │
+          ┌────────┴────────┐
+          │  检查双腿结果    │
+          ├─ 都成功 → 记录  │
+          ├─ 单腿失败 → 反向平仓另一腿
+          └─ 都失败 → 跳过  │
+                   │
     ▼ 仓位更新，等待下一个信号
 ```
 
@@ -288,9 +294,9 @@ python main.py --ticker BTC --size 0.001 --max-position 0.01
 # 1. 创建一个新的 screen 会话（命名为 arb）
 screen -S arb
 
-# 2. 在 screen 内启动机器人
+# 2. 在 screen 内启动机器人（同时记录完整日志到文件）
 cd /path/to/P-V
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+python main.py --ticker BTC --size 0.001 --max-position 0.01 2>&1 | tee -a logs/run_$(date +%F_%H%M%S).log
 
 # 3. 分离 screen（程序继续在后台运行）
 #    快捷键: Ctrl+A 然后按 D
@@ -302,16 +308,18 @@ screen -r arb
 screen -ls
 ```
 
+> **日志说明**: `2>&1 | tee -a logs/run_xxx.log` 会将所有输出（含错误信息）同时显示在 screen 终端和写入日志文件，文件名自动包含启动时间戳，例如 `logs/run_2026-02-14_153022.log`。
+
 #### 多交易对同时运行
 
 ```bash
 # 为每个交易对创建单独的 screen
 screen -S arb-btc
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+python main.py --ticker BTC --size 0.001 --max-position 0.01 2>&1 | tee -a logs/run_BTC_$(date +%F_%H%M%S).log
 # Ctrl+A, D 分离
 
 screen -S arb-eth
-python main.py --ticker ETH --size 0.01 --max-position 0.1
+python main.py --ticker ETH --size 0.01 --max-position 0.1 2>&1 | tee -a logs/run_ETH_$(date +%F_%H%M%S).log
 # Ctrl+A, D 分离
 ```
 
@@ -337,6 +345,7 @@ python main.py \
   --max-position 0.01 \
   --long-threshold 10 \
   --short-threshold 10 \
+  --min-spread 5 \
   --fill-timeout 5 \
   --min-balance 10 \
   --warmup-samples 100 \
@@ -352,6 +361,7 @@ python main.py \
 | `--max-position` | Decimal | **必填** | 最大持仓限制 (单边绝对值) |
 | `--long-threshold` | Decimal | 10 | 做多触发: 价差 > 均值 + 此值 |
 | `--short-threshold` | Decimal | 10 | 做空触发: 价差 > 均值 + 此值 |
+| `--min-spread` | Decimal | 5 | 最低价差绝对阈值 (防止均值为负时误触发) |
 | `--fill-timeout` | int | 5 | 吃单成交确认超时 (秒) |
 | `--min-balance` | Decimal | 10 | 最低余额 (USDC)，低于此值平仓退出 |
 | `--warmup-samples` | int | 100 | 预热采样数量 |
@@ -557,7 +567,8 @@ async with AsyncSession(impersonate="chrome131") as session:
 | **最大持仓限制** | 单边持仓不超过 `--max-position` |
 | **余额不足退出** | 任一交易所余额 < `--min-balance` 时自动平仓退出 |
 | **仓位不平衡检测** | 每 30 分钟检查，净仓位 > 2倍单笔时报警 |
-| **订单超时取消** | Paradex 吃单超时 (默认 5s) 未成交自动取消 |
+| **单腿失败保护** | 双腿同时下单，任一失败自动反向平仓另一腿 |
+| **Interactive 限速** | 检测 INTERACTIVE 标志丢失 → 暂停 10 分钟；接近 200/h 或 1000/d 限制时主动减速 |
 | **优雅退出** | Ctrl+C 触发: 取消挂单 → 市价平仓 → 确认仓位归零 |
 | **Telegram 报警** | 对冲失败、仓位不平衡等异常发送即时通知 |
 
@@ -594,7 +605,30 @@ async with AsyncSession(impersonate="chrome131") as session:
 - 机器人启动/退出
 - 每笔套利成交
 - 对冲失败报警
-- 每 30 分钟状态报告 (余额、仓位、价差均值)
+- 每 30 分钟状态报告 (余额、仓位、价差均值、限速状态)
+
+### 从 VPS 下载日志到本地 Windows
+
+在 **Windows cmd 或 PowerShell** 中执行 `scp` 命令，将 VPS 上的日志文件夹拉到本地：
+
+```bash
+# 下载整个 logs 文件夹到当前目录
+scp -r root@你的VPS_IP:/path/to/P-V/logs ./logs
+
+# 下载整个 logs 文件夹到指定目录
+scp -r root@你的VPS_IP:/path/to/P-V/logs D:\Downloads\arb-logs
+
+# 只下载今天的运行日志
+scp root@你的VPS_IP:/path/to/P-V/logs/run_2026-02-14*.log D:\Downloads\
+
+# 只下载 CSV 数据文件
+scp root@你的VPS_IP:/path/to/P-V/logs/*.csv D:\Downloads\arb-logs\
+
+# 如果 SSH 使用非默认端口（例如 2222）
+scp -P 2222 -r root@你的VPS_IP:/path/to/P-V/logs ./logs
+```
+
+> **提示**: Windows 10/11 自带 `scp` 命令 (OpenSSH 客户端)。如果提示找不到 scp，在「设置 → 应用 → 可选功能」中安装「OpenSSH 客户端」。也可使用 [WinSCP](https://winscp.net) 图形化工具。
 
 ---
 

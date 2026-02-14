@@ -58,6 +58,12 @@ def parse_arguments():
         help="做空价差触发偏移量 (默认: 10)",
     )
     parser.add_argument(
+        "--min-spread",
+        type=Decimal,
+        default=Decimal("5"),
+        help="最低价差绝对阈值 (防止均值为负时误触发) (默认: 5)",
+    )
+    parser.add_argument(
         "--fill-timeout",
         type=int,
         default=5,
@@ -107,6 +113,7 @@ async def main():
     config.trading.max_position = args.max_position
     config.trading.long_threshold = args.long_threshold
     config.trading.short_threshold = args.short_threshold
+    config.trading.min_spread = args.min_spread
     config.trading.fill_timeout = args.fill_timeout
     config.trading.min_balance = args.min_balance
     config.trading.warmup_samples = args.warmup_samples
@@ -149,6 +156,7 @@ async def main():
         max_position=config.trading.max_position,
         long_threshold=config.trading.long_threshold,
         short_threshold=config.trading.short_threshold,
+        min_spread=config.trading.min_spread,
         fill_timeout=config.trading.fill_timeout,
         min_balance=config.trading.min_balance,
         warmup_samples=config.trading.warmup_samples,

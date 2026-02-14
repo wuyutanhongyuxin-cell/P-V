@@ -271,8 +271,47 @@ class VariationalClient(BaseExchangeClient):
 
     # ========== 市场数据 ==========
 
-    async def get_bbo(self, market: str) -> Optional[BBO]:
-        """获取买一卖一价格 (从公开 stats 接口)"""
+    async def get_bbo(
+        self, market: str, size: Optional[Decimal] = None
+    ) -> Optional[BBO]:
+        """
+        获取买一卖一价格
+        - size 不为 None: 使用 RFQ indicative 报价 (实时, 推荐用于交易决策)
+        - size 为 None: 降级到 /metadata/stats (仅用于非关键场景)
+        """
+        if size is not None:
+            return await self._get_bbo_from_rfq(market, size)
+        return await self._get_bbo_from_stats(market)
+
+    async def _get_bbo_from_rfq(
+        self, market: str, size: Decimal
+    ) -> Optional[BBO]:
+        """通过 RFQ indicative 报价获取实时 BBO"""
+        try:
+            data = await self._get_indicative_quote(market, size)
+            if not data:
+                logger.warning("RFQ 报价返回空，降级到 stats")
+                return await self._get_bbo_from_stats(market)
+
+            bid = data.get("bid")
+            ask = data.get("ask")
+
+            if bid is None or ask is None:
+                logger.warning(f"RFQ 报价缺少 bid/ask: {data}")
+                return await self._get_bbo_from_stats(market)
+
+            return BBO(
+                bid=Decimal(str(bid)),
+                ask=Decimal(str(ask)),
+                timestamp=time.time(),
+            )
+
+        except Exception as e:
+            logger.error(f"RFQ BBO 异常: {e}")
+            return await self._get_bbo_from_stats(market)
+
+    async def _get_bbo_from_stats(self, market: str) -> Optional[BBO]:
+        """从公开 stats 接口获取 BBO (延迟较大, 降级方案)"""
         try:
             stats = await self._fetch_stats()
             if not stats:
@@ -454,10 +493,12 @@ class VariationalClient(BaseExchangeClient):
             logger.error(f"Variational 限价单异常: {e}")
             return OrderResult(success=False, error_message=str(e))
 
-    async def _get_quote(self, market: str, size: Decimal) -> Optional[str]:
+    async def _get_indicative_quote(
+        self, market: str, size: Decimal
+    ) -> Optional[Dict[str, Any]]:
         """
-        获取 RFQ 报价 — POST /api/quotes/indicative
-        返回 quote_id (市价单第1步)
+        获取 RFQ indicative 报价 — POST /api/quotes/indicative
+        返回完整响应 (含 quote_id, bid, ask 等)
         """
         payload = {
             "instrument": self.build_instrument_obj(market),
@@ -465,13 +506,9 @@ class VariationalClient(BaseExchangeClient):
         }
 
         data = await self._request("POST", ENDPOINTS["quote_indicative"], json_data=payload)
-        if data is None:
-            return None
-
-        quote_id = data.get("quote_id", data.get("id"))
-        if quote_id:
-            logger.debug(f"Variational 报价成功: {quote_id}")
-        return quote_id
+        if data:
+            logger.debug(f"Variational RFQ 报价: {data}")
+        return data
 
     async def place_market_order(
         self,
@@ -488,9 +525,13 @@ class VariationalClient(BaseExchangeClient):
         """
         try:
             # Step 1: 获取报价
-            quote_id = await self._get_quote(market, size)
-            if not quote_id:
+            quote_data = await self._get_indicative_quote(market, size)
+            if not quote_data:
                 return OrderResult(success=False, error_message="获取 RFQ 报价失败")
+
+            quote_id = quote_data.get("quote_id", quote_data.get("id"))
+            if not quote_id:
+                return OrderResult(success=False, error_message="RFQ 报价缺少 quote_id")
 
             # Step 2: 提交市价单
             payload = {

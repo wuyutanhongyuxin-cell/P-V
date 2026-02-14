@@ -113,6 +113,7 @@ class TradingConfig:
     max_position: Decimal = Decimal("0.01")
     long_threshold: Decimal = Decimal("10")
     short_threshold: Decimal = Decimal("10")
+    min_spread: Decimal = Decimal("5")
     fill_timeout: int = 5
     min_balance: Decimal = Decimal("10")
     warmup_samples: int = 100
