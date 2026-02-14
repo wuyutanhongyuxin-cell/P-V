@@ -84,6 +84,8 @@ class ArbitrageEngine:
         self.trade_count = 0
         self.start_time = time.time()
         self.last_balance_report_time = time.time()
+        self.last_trade_time: float = 0
+        self.trade_cooldown: float = 3.0  # 交易后冷却 3 秒
 
     # ========== 信号处理与优雅退出 ==========
 
@@ -282,21 +284,23 @@ class ArbitrageEngine:
                     short_spread=self.spread_analyzer.current_short_spread,
                 )
 
-                # 4. 检查交易信号
+                # 4. 检查交易信号 (冷却期内跳过)
                 signal_result = self.spread_analyzer.check_signal()
 
                 if signal_result and not self.stop_flag:
-                    # 5. 检查仓位限制
-                    if signal_result.direction == "LONG" and self.position_tracker.can_open_long(self.size):
+                    # 冷却检查: 上次交易后等待 N 秒
+                    if time.time() - self.last_trade_time < self.trade_cooldown:
+                        pass  # 冷却中，跳过
+                    elif signal_result.direction == "LONG" and self.position_tracker.can_open_long(self.size):
                         await self._execute_long_trade(p_bbo, v_bbo, signal_result)
                     elif signal_result.direction == "SHORT" and self.position_tracker.can_open_short(self.size):
                         await self._execute_short_trade(p_bbo, v_bbo, signal_result)
 
-                # 6. 定期检查余额和仓位
+                # 5. 定期检查余额和仓位
                 await self._periodic_checks()
 
-                # 等待下一轮
-                await asyncio.sleep(0.05)
+                # 等待下一轮 (1秒间隔，匹配价差采样频率)
+                await asyncio.sleep(1.0)
 
             except asyncio.CancelledError:
                 break
@@ -379,11 +383,16 @@ class ArbitrageEngine:
         logger.info(f"[Paradex] 订单已提交: {order_id}")
 
         # 2. 等待成交
-        filled = await self._wait_for_fill(order_id)
+        fill_status = await self._wait_for_fill(order_id)
 
-        if not filled:
+        if fill_status == "rejected":
+            logger.info(f"[Paradex] POST_ONLY 订单被拒 (穿越价差): {order_id}")
+            self.last_trade_time = time.time()  # 触发冷却
+            return
+        elif fill_status == "timeout":
             logger.info(f"[Paradex] 订单超时未成交，取消: {order_id}")
             await self.paradex.cancel_order(order_id)
+            self.last_trade_time = time.time()
             return
 
         logger.info(f"[Paradex] 买单成交: {self.size} @ {order_price}")
@@ -397,11 +406,12 @@ class ArbitrageEngine:
             size=self.size,
         )
 
+        self.last_trade_time = time.time()  # 成功或失败都冷却
+
         if hedge_result.success:
             logger.info(f"[Variational] 对冲成功: {hedge_result.order_id}")
             self.trade_count += 1
 
-            # 记录交易
             self.data_logger.log_trade(
                 direction="LONG",
                 paradex_side="BUY",
@@ -477,11 +487,16 @@ class ArbitrageEngine:
         order_id = result.order_id
 
         # 2. 等待成交
-        filled = await self._wait_for_fill(order_id)
+        fill_status = await self._wait_for_fill(order_id)
 
-        if not filled:
+        if fill_status == "rejected":
+            logger.info(f"[Paradex] POST_ONLY 订单被拒 (穿越价差): {order_id}")
+            self.last_trade_time = time.time()
+            return
+        elif fill_status == "timeout":
             logger.info(f"[Paradex] 订单超时未成交，取消: {order_id}")
             await self.paradex.cancel_order(order_id)
+            self.last_trade_time = time.time()
             return
 
         logger.info(f"[Paradex] 卖单成交: {self.size} @ {order_price}")
@@ -494,6 +509,8 @@ class ArbitrageEngine:
             side="BUY",
             size=self.size,
         )
+
+        self.last_trade_time = time.time()
 
         if hedge_result.success:
             logger.info(f"[Variational] 对冲成功: {hedge_result.order_id}")
@@ -528,9 +545,13 @@ class ArbitrageEngine:
                     f"错误: {hedge_result.error_message}"
                 )
 
-    async def _wait_for_fill(self, order_id: str) -> bool:
-        """等待 Paradex 订单成交，超时返回 False"""
+    async def _wait_for_fill(self, order_id: str) -> str:
+        """
+        等待 Paradex 订单成交
+        返回: "filled" / "rejected" / "timeout"
+        """
         start = time.time()
+        first_check = True
         while time.time() - start < self.fill_timeout and not self.stop_flag:
             info = await self.paradex.get_order_info(order_id)
             if info:
@@ -538,15 +559,19 @@ class ArbitrageEngine:
                 remaining = Decimal(info.get("remaining_size", "1"))
 
                 if status == "CLOSED" and remaining == 0:
-                    return True  # 完全成交
+                    return "filled"
                 elif status == "CLOSED":
-                    return False  # 被取消
+                    # POST_ONLY 订单穿越价差被立即拒绝
+                    if first_check:
+                        return "rejected"
+                    return "timeout"  # 等了一会儿后被取消
                 elif status == "OPEN" and remaining == 0:
-                    return True  # 完全成交
+                    return "filled"
 
-            await asyncio.sleep(0.1)
+            first_check = False
+            await asyncio.sleep(0.3)
 
-        return False  # 超时
+        return "timeout"
 
     # ========== 定期检查 ==========
 

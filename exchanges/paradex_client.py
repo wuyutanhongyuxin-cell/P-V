@@ -187,6 +187,11 @@ class ParadexInteractiveClient(BaseExchangeClient):
                         ask_size=Decimal(asks[0][1]),
                         timestamp=time.time(),
                     )
+                elif resp.status == 429:
+                    import asyncio
+                    logger.warning("Paradex 限流 (429)，等待 5 秒...")
+                    await asyncio.sleep(5)
+                    return None
                 else:
                     logger.warning(f"获取 Paradex BBO 失败: {resp.status}")
                     return None
