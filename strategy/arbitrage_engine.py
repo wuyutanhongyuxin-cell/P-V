@@ -433,6 +433,26 @@ class ArbitrageEngine:
         )
         logger.info("=" * 60)
 
+        # 发送 Telegram 心跳通知
+        if self.telegram:
+            self.telegram.send(
+                f"💓 <b>心跳状态</b>\n\n"
+                f"⏱ 运行: {runtime_hours:.1f}h\n"
+                f"📊 交易: {self.trade_count} 笔\n"
+                f"📈 监控周期: {self.spread_analyzer.sample_count}\n\n"
+                f"<b>做多价差</b>\n"
+                f"• 当前: ${long_spread:.2f}\n"
+                f"• 触发线: ${long_trigger:.2f}\n"
+                f"• 还差: ${long_gap:.2f} {'✅' if long_gap <= 0 else '⏳'}\n\n"
+                f"<b>做空价差</b>\n"
+                f"• 当前: ${short_spread:.2f}\n"
+                f"• 触发线: ${short_trigger:.2f}\n"
+                f"• 还差: ${short_gap:.2f} {'✅' if short_gap <= 0 else '⏳'}\n\n"
+                f"<b>仓位</b>\n"
+                f"• Paradex: {self.position_tracker.paradex_position:+.6f}\n"
+                f"• Variational: {self.position_tracker.variational_position:+.6f}"
+            )
+
     def _calculate_profit_estimate(
         self,
         direction: str,
@@ -502,7 +522,7 @@ class ArbitrageEngine:
         }
 
     def _log_profit_estimate(self, profit_info: dict) -> None:
-        """打印利润预估"""
+        """打印利润预估并发送 Telegram 通知"""
         direction = profit_info["direction"]
         spread = profit_info["spread"]
         size = profit_info["size"]
@@ -510,6 +530,8 @@ class ArbitrageEngine:
         total_fee = profit_info["total_fee"]
         net_profit = profit_info["net_profit"]
         roi_pct = profit_info["roi_pct"]
+        paradex_price = profit_info["paradex_price"]
+        variational_price = profit_info["variational_price"]
 
         logger.info(
             f"💰 [利润预估] 价差: ${spread:.2f} × {size} = ${gross_profit:.2f} | "
@@ -517,6 +539,26 @@ class ArbitrageEngine:
             f"净利润: ${net_profit:.2f} | "
             f"ROI: {roi_pct:.3f}%"
         )
+
+        # 发送 Telegram 通知
+        if self.telegram:
+            direction_emoji = "📈" if direction == "LONG" else "📉"
+            direction_text = "做多套利" if direction == "LONG" else "做空套利"
+
+            self.telegram.send(
+                f"{direction_emoji} <b>{direction_text}信号</b>\n\n"
+                f"<b>价格</b>\n"
+                f"• Paradex: ${paradex_price:.2f}\n"
+                f"• Variational: ${variational_price:.2f}\n"
+                f"• 价差: ${spread:.2f}\n\n"
+                f"<b>利润预估</b>\n"
+                f"• 数量: {size}\n"
+                f"• 毛利润: ${gross_profit:.2f}\n"
+                f"• 手续费: ${total_fee:.2f}\n"
+                f"• <b>净利润: ${net_profit:.2f}</b>\n"
+                f"• ROI: {roi_pct:.3f}%\n\n"
+                f"⏳ 准备下单..."
+            )
 
     # ========== 交易执行 ==========
 
@@ -592,6 +634,15 @@ class ArbitrageEngine:
                 f"[做多成交] #{self.trade_count} Paradex BUY {self.size} @ {order_price} | "
                 f"Variational SELL {self.size}"
             )
+
+            # 发送 Telegram 成交通知
+            if self.telegram:
+                self.telegram.send(
+                    f"✅ <b>做多成交 #{self.trade_count}</b>\n\n"
+                    f"• Paradex BUY: {self.size} @ ${order_price:.2f}\n"
+                    f"• Variational SELL: {self.size}\n"
+                    f"• 预估净利润: ${profit_info['net_profit']:.2f}"
+                )
 
             self.data_logger.log_trade(
                 direction="LONG",
@@ -712,6 +763,15 @@ class ArbitrageEngine:
                 f"[做空成交] #{self.trade_count} Paradex SELL {self.size} @ {order_price} | "
                 f"Variational BUY {self.size}"
             )
+
+            # 发送 Telegram 成交通知
+            if self.telegram:
+                self.telegram.send(
+                    f"✅ <b>做空成交 #{self.trade_count}</b>\n\n"
+                    f"• Paradex SELL: {self.size} @ ${order_price:.2f}\n"
+                    f"• Variational BUY: {self.size}\n"
+                    f"• 预估净利润: ${profit_info['net_profit']:.2f}"
+                )
 
             self.data_logger.log_trade(
                 direction="SHORT",
