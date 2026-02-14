@@ -433,6 +433,91 @@ class ArbitrageEngine:
         )
         logger.info("=" * 60)
 
+    def _calculate_profit_estimate(
+        self,
+        direction: str,
+        p_bbo: BBO,
+        v_bbo: BBO,
+        size: Decimal,
+        spread: Decimal,
+    ) -> dict:
+        """
+        计算预估利润
+
+        做多套利 (LONG):
+          - Paradex BUY @ ask
+          - Variational SELL @ bid
+          - 价差利润 = (variational_bid - paradex_ask) * size
+
+        做空套利 (SHORT):
+          - Paradex SELL @ bid
+          - Variational BUY @ ask
+          - 价差利润 = (paradex_bid - variational_ask) * size
+
+        手续费:
+          - Paradex Interactive Token: 0%
+          - Variational: 0%
+        """
+        if direction == "LONG":
+            # 做多：Paradex 买入成本，Variational 卖出收入
+            paradex_price = p_bbo.ask
+            variational_price = v_bbo.bid
+            gross_profit = spread * size  # variational_bid - paradex_ask
+        else:  # SHORT
+            # 做空：Paradex 卖出收入，Variational 买入成本
+            paradex_price = p_bbo.bid
+            variational_price = v_bbo.ask
+            gross_profit = spread * size  # paradex_bid - variational_ask
+
+        # 手续费计算（虽然是0，但显式展示）
+        paradex_fee = Decimal("0")  # Interactive Token 零手续费
+        variational_fee = Decimal("0")  # Variational 零手续费
+        total_fee = paradex_fee + variational_fee
+
+        # 净利润
+        net_profit = gross_profit - total_fee
+
+        # 理论收益率（相对于投入资金）
+        # 投入资金 = Paradex 买入成本（做多）或 Variational 买入成本（做空）
+        if direction == "LONG":
+            capital = paradex_price * size  # Paradex 买入需要的资金
+        else:
+            capital = variational_price * size  # Variational 买入需要的资金
+
+        roi_pct = (net_profit / capital * Decimal("100")) if capital > 0 else Decimal("0")
+
+        return {
+            "direction": direction,
+            "paradex_price": float(paradex_price),
+            "variational_price": float(variational_price),
+            "size": float(size),
+            "spread": float(spread),
+            "gross_profit": float(gross_profit),
+            "paradex_fee": float(paradex_fee),
+            "variational_fee": float(variational_fee),
+            "total_fee": float(total_fee),
+            "net_profit": float(net_profit),
+            "capital": float(capital),
+            "roi_pct": float(roi_pct),
+        }
+
+    def _log_profit_estimate(self, profit_info: dict) -> None:
+        """打印利润预估"""
+        direction = profit_info["direction"]
+        spread = profit_info["spread"]
+        size = profit_info["size"]
+        gross_profit = profit_info["gross_profit"]
+        total_fee = profit_info["total_fee"]
+        net_profit = profit_info["net_profit"]
+        roi_pct = profit_info["roi_pct"]
+
+        logger.info(
+            f"💰 [利润预估] 价差: ${spread:.2f} × {size} = ${gross_profit:.2f} | "
+            f"手续费: ${total_fee:.2f} | "
+            f"净利润: ${net_profit:.2f} | "
+            f"ROI: {roi_pct:.3f}%"
+        )
+
     # ========== 交易执行 ==========
 
     async def _execute_long_trade(
@@ -449,6 +534,16 @@ class ArbitrageEngine:
             f"[做多信号] spread={signal.spread:.4f} > mean({signal.mean:.4f}) + "
             f"threshold({signal.threshold:.4f})"
         )
+
+        # 计算并打印利润预估
+        profit_info = self._calculate_profit_estimate(
+            direction="LONG",
+            p_bbo=p_bbo,
+            v_bbo=v_bbo,
+            size=self.size,
+            spread=signal.spread,
+        )
+        self._log_profit_estimate(profit_info)
 
         # 更新仓位
         await self._refresh_positions()
@@ -560,6 +655,16 @@ class ArbitrageEngine:
             f"[做空信号] spread={signal.spread:.4f} > mean({signal.mean:.4f}) + "
             f"threshold({signal.threshold:.4f})"
         )
+
+        # 计算并打印利润预估
+        profit_info = self._calculate_profit_estimate(
+            direction="SHORT",
+            p_bbo=p_bbo,
+            v_bbo=v_bbo,
+            size=self.size,
+            spread=signal.spread,
+        )
+        self._log_profit_estimate(profit_info)
 
         await self._refresh_positions()
         self.position_tracker.log_positions()
