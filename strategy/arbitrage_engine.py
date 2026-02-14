@@ -4,7 +4,7 @@
 架构:
   1. 同时获取 Paradex 和 Variational 的 BBO
   2. 价差采样 + 动态均值阈值判断
-  3. Paradex 挂 POST_ONLY 限价单 (maker, interactive token 零手续费)
+  3. Paradex 直接吃单 (taker, interactive token 零手续费)
   4. Variational 市价对冲 (taker, 零手续费)
   5. 仓位跟踪 + 风险控制
   6. 优雅退出 (取消挂单 → 市价平仓 → 确认归零 → 退出)
@@ -35,7 +35,7 @@ logger = logging.getLogger("arbitrage")
 class ArbitrageEngine:
     """
     Paradex × Variational 跨所价差套利引擎
-    策略: Paradex (maker, POST_ONLY) + Variational (taker, market order)
+    策略: Paradex (taker, interactive token 零手续费) + Variational (taker, market order)
     """
 
     def __init__(
@@ -86,7 +86,6 @@ class ArbitrageEngine:
         self.last_balance_report_time = time.time()
         self.last_trade_time: float = 0
         self.trade_cooldown: float = 3.0  # 交易后冷却 3 秒
-        self.consecutive_rejects: int = 0  # 连续拒绝计数
 
     # ========== 信号处理与优雅退出 ==========
 
@@ -339,10 +338,9 @@ class ArbitrageEngine:
         self, p_bbo: BBO, v_bbo: BBO, signal: SpreadSignal
     ) -> None:
         """
-        执行做多套利:
-          1. Paradex 挂 POST_ONLY 买单 (maker, 0手续费)
-          2. 等待成交
-          3. Variational 市价卖出对冲 (taker, 0手续费)
+        执行做多套利 (taker 模式, interactive token 零手续费):
+          1. Paradex 直接吃单买入 (taker, 秒成交)
+          2. Variational 市价卖出对冲
         """
         if self.stop_flag:
             return
@@ -360,67 +358,38 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做多")
             return
 
-        # 1. Paradex 挂 POST_ONLY 买单 (maker)
-        p_info = await self.paradex.get_market_info(self.paradex_market)
-        tick = p_info.tick_size if p_info else Decimal("0.1")
+        # 1. Paradex 直接吃单买入 (taker, 以 ask 价格成交)
+        order_price = p_bbo.ask
 
-        # 价差宽度检查: 至少 2 ticks 才能安全放 POST_ONLY
-        spread_width = p_bbo.ask - p_bbo.bid
-        if spread_width <= tick:
-            logger.debug(f"Paradex 价差过窄 ({spread_width}), POST_ONLY 易被拒，跳过")
-            return
-
-        order_price = p_bbo.ask - tick
-
-        # 连续拒绝退避: 连续被拒后增加冷却
-        if self.consecutive_rejects >= 3:
-            backoff = min(self.consecutive_rejects * 5, 30)
-            logger.info(f"连续 {self.consecutive_rejects} 次被拒，退避 {backoff}s")
-            self.last_trade_time = time.time() + backoff - self.trade_cooldown
-            self.consecutive_rejects = 0
-            return
-
-        logger.info(f"[Paradex] 挂买单: {self.size} @ {order_price} (POST_ONLY)")
+        logger.info(f"[Paradex] 吃单买入: {self.size} @ {order_price}")
 
         result = await self.paradex.place_limit_order(
             market=self.paradex_market,
             side="BUY",
             size=self.size,
             price=order_price,
-            post_only=True,
+            post_only=False,
         )
 
         if not result.success:
-            logger.warning(f"[Paradex] 挂单失败: {result.error_message}")
+            logger.warning(f"[Paradex] 下单失败: {result.error_message}")
+            self.last_trade_time = time.time()
             return
 
         order_id = result.order_id
-        logger.info(f"[Paradex] 订单已提交: {order_id}")
 
-        # 2. 等待成交
+        # 确认成交 (taker 应秒成交，短超时即可)
         fill_status = await self._wait_for_fill(order_id)
 
-        if fill_status == "rejected":
-            self.consecutive_rejects += 1
-            logger.info(
-                f"[Paradex] POST_ONLY 被拒 (穿越价差): {order_id[-8:]} "
-                f"(连续 {self.consecutive_rejects} 次)"
-            )
-            self.last_trade_time = time.time()
-            return
-        elif fill_status == "timeout":
-            self.consecutive_rejects += 1
-            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id[-8:]}")
+        if fill_status != "filled":
+            logger.warning(f"[Paradex] 吃单未成交 ({fill_status})，取消: {order_id[-8:]}")
             await self.paradex.cancel_order(order_id)
             self.last_trade_time = time.time()
             return
 
-        # 成交了，重置拒绝计数
-        self.consecutive_rejects = 0
+        logger.info(f"[Paradex] 买入成交: {self.size} @ {order_price}")
 
-        logger.info(f"[Paradex] 买单成交: {self.size} @ {order_price}")
-
-        # 3. Variational 市价卖出对冲
+        # 2. Variational 市价卖出对冲
         logger.info(f"[Variational] 市价卖出对冲: {self.size}")
 
         hedge_result = await self.variational.place_market_order(
@@ -429,7 +398,7 @@ class ArbitrageEngine:
             size=self.size,
         )
 
-        self.last_trade_time = time.time()  # 成功或失败都冷却
+        self.last_trade_time = time.time()
 
         if hedge_result.success:
             logger.info(f"[Variational] 对冲成功: {hedge_result.order_id}")
@@ -468,10 +437,9 @@ class ArbitrageEngine:
         self, p_bbo: BBO, v_bbo: BBO, signal: SpreadSignal
     ) -> None:
         """
-        执行做空套利:
-          1. Paradex 挂 POST_ONLY 卖单 (maker, 0手续费)
-          2. 等待成交
-          3. Variational 市价买入对冲 (taker, 0手续费)
+        执行做空套利 (taker 模式, interactive token 零手续费):
+          1. Paradex 直接吃单卖出 (taker, 秒成交)
+          2. Variational 市价买入对冲
         """
         if self.stop_flag:
             return
@@ -488,66 +456,38 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做空")
             return
 
-        # 1. Paradex 挂 POST_ONLY 卖单 (maker)
-        p_info = await self.paradex.get_market_info(self.paradex_market)
-        tick = p_info.tick_size if p_info else Decimal("0.1")
+        # 1. Paradex 直接吃单卖出 (taker, 以 bid 价格成交)
+        order_price = p_bbo.bid
 
-        # 价差宽度检查: 至少 2 ticks 才能安全放 POST_ONLY
-        spread_width = p_bbo.ask - p_bbo.bid
-        if spread_width <= tick:
-            logger.debug(f"Paradex 价差过窄 ({spread_width}), POST_ONLY 易被拒，跳过")
-            return
-
-        order_price = p_bbo.bid + tick
-
-        # 连续拒绝退避
-        if self.consecutive_rejects >= 3:
-            backoff = min(self.consecutive_rejects * 5, 30)
-            logger.info(f"连续 {self.consecutive_rejects} 次被拒，退避 {backoff}s")
-            self.last_trade_time = time.time() + backoff - self.trade_cooldown
-            self.consecutive_rejects = 0
-            return
-
-        logger.info(f"[Paradex] 挂卖单: {self.size} @ {order_price} (POST_ONLY)")
+        logger.info(f"[Paradex] 吃单卖出: {self.size} @ {order_price}")
 
         result = await self.paradex.place_limit_order(
             market=self.paradex_market,
             side="SELL",
             size=self.size,
             price=order_price,
-            post_only=True,
+            post_only=False,
         )
 
         if not result.success:
-            logger.warning(f"[Paradex] 挂单失败: {result.error_message}")
+            logger.warning(f"[Paradex] 下单失败: {result.error_message}")
+            self.last_trade_time = time.time()
             return
 
         order_id = result.order_id
 
-        # 2. 等待成交
+        # 确认成交 (taker 应秒成交)
         fill_status = await self._wait_for_fill(order_id)
 
-        if fill_status == "rejected":
-            self.consecutive_rejects += 1
-            logger.info(
-                f"[Paradex] POST_ONLY 被拒 (穿越价差): {order_id[-8:]} "
-                f"(连续 {self.consecutive_rejects} 次)"
-            )
-            self.last_trade_time = time.time()
-            return
-        elif fill_status == "timeout":
-            self.consecutive_rejects += 1
-            logger.info(f"[Paradex] 订单超时未成交，取消: {order_id[-8:]}")
+        if fill_status != "filled":
+            logger.warning(f"[Paradex] 吃单未成交 ({fill_status})，取消: {order_id[-8:]}")
             await self.paradex.cancel_order(order_id)
             self.last_trade_time = time.time()
             return
 
-        # 成交了，重置拒绝计数
-        self.consecutive_rejects = 0
+        logger.info(f"[Paradex] 卖出成交: {self.size} @ {order_price}")
 
-        logger.info(f"[Paradex] 卖单成交: {self.size} @ {order_price}")
-
-        # 3. Variational 市价买入对冲
+        # 2. Variational 市价买入对冲
         logger.info(f"[Variational] 市价买入对冲: {self.size}")
 
         hedge_result = await self.variational.place_market_order(
