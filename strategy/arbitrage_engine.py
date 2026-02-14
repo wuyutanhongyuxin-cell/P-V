@@ -89,6 +89,9 @@ class ArbitrageEngine:
         self.last_trade_time: float = 0
         self.trade_cooldown: float = 3.0  # 交易后冷却 3 秒
 
+        # BBO 失败计数器
+        self._bbo_fail_count = 0
+
     # ========== 信号处理与优雅退出 ==========
 
     def setup_signal_handlers(self) -> None:
@@ -265,8 +268,25 @@ class ArbitrageEngine:
                 p_bbo, v_bbo = await self._fetch_both_bbo()
 
                 if not p_bbo or not v_bbo:
+                    self._bbo_fail_count += 1
+                    # 每 10 次失败打印一次 WARNING，避免刷屏
+                    if self._bbo_fail_count % 10 == 1:
+                        fail_reason = []
+                        if not p_bbo:
+                            fail_reason.append("Paradex")
+                        if not v_bbo:
+                            fail_reason.append("Variational")
+                        logger.warning(
+                            f"BBO 获取失败 ({' & '.join(fail_reason)})，"
+                            f"已连续失败 {self._bbo_fail_count} 次，等待重试..."
+                        )
                     await asyncio.sleep(0.5)
                     continue
+                else:
+                    # 成功后重置计数器
+                    if self._bbo_fail_count > 0:
+                        logger.info(f"BBO 获取恢复正常（之前连续失败 {self._bbo_fail_count} 次）")
+                        self._bbo_fail_count = 0
 
                 # 2. 价差采样
                 self.spread_analyzer.add_sample(
