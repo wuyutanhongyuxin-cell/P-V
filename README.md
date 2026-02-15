@@ -283,7 +283,7 @@ ACCOUNT_LABEL=A1                # 账号标签
 ### 基本用法
 
 ```bash
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10
 ```
 
 ### 使用 screen 后台运行 (推荐)
@@ -296,7 +296,7 @@ screen -S arb
 
 # 2. 在 screen 内启动机器人（同时记录完整日志到文件）
 cd /path/to/P-V
-python main.py --ticker BTC --size 0.001 --max-position 0.01 2>&1 | tee -a logs/run_$(date +%F_%H%M%S).log
+python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10 2>&1 | tee -a logs/run_$(date +%F_%H%M%S).log
 
 # 3. 分离 screen（程序继续在后台运行）
 #    快捷键: Ctrl+A 然后按 D
@@ -315,11 +315,11 @@ screen -ls
 ```bash
 # 为每个交易对创建单独的 screen
 screen -S arb-btc
-python main.py --ticker BTC --size 0.001 --max-position 0.01 2>&1 | tee -a logs/run_BTC_$(date +%F_%H%M%S).log
+python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10 2>&1 | tee -a logs/run_BTC_$(date +%F_%H%M%S).log
 # Ctrl+A, D 分离
 
 screen -S arb-eth
-python main.py --ticker ETH --size 0.01 --max-position 0.1 2>&1 | tee -a logs/run_ETH_$(date +%F_%H%M%S).log
+python main.py --ticker ETH --size 0.01 --max-position 0.1 --min-spread 20 --long-threshold 10 --short-threshold 10 2>&1 | tee -a logs/run_ETH_$(date +%F_%H%M%S).log
 # Ctrl+A, D 分离
 ```
 
@@ -345,7 +345,7 @@ python main.py \
   --max-position 0.01 \
   --long-threshold 10 \
   --short-threshold 10 \
-  --min-spread 5 \
+  --min-spread 20 \
   --fill-timeout 5 \
   --min-balance 10 \
   --warmup-samples 100 \
@@ -676,19 +676,19 @@ vr-token 已过期 (通常 7 天有效)，需要：
 
 ```bash
 # 使用 Anaconda 或直接 Python
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10
 
 # 如果控制台中文乱码，设置编码:
 set PYTHONIOENCODING=utf-8
-python main.py --ticker BTC --size 0.001 --max-position 0.01
+python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10
 ```
 
 ### Q: 如何同时套利多个交易对？
 
 使用 `screen` 为每个交易对创建独立会话（参见[使用方法](#使用-screen-后台运行-推荐)）：
 ```bash
-screen -S arb-btc -dm python main.py --ticker BTC --size 0.001 --max-position 0.01
-screen -S arb-eth -dm python main.py --ticker ETH --size 0.01 --max-position 0.1
+screen -S arb-btc -dm python main.py --ticker BTC --size 0.001 --max-position 0.01 --min-spread 20 --long-threshold 10 --short-threshold 10
+screen -S arb-eth -dm python main.py --ticker ETH --size 0.01 --max-position 0.1 --min-spread 20 --long-threshold 10 --short-threshold 10
 
 # 查看所有会话
 screen -ls
