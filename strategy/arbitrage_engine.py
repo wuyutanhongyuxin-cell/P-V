@@ -595,20 +595,16 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做多")
             return
 
-        order_price = p_bbo.ask
-
         logger.info(
-            f"[同时下单] Paradex BUY {self.size} @ {order_price} | "
-            f"Variational SELL {self.size}"
+            f"[同时下单] Paradex BUY {self.size} (市价) | "
+            f"Variational SELL {self.size} (市价)"
         )
 
-        # 双腿同时发送
-        p_coro = self.paradex.place_limit_order(
+        # 双腿同时发送 — 都用市价单确保立即全部成交
+        p_coro = self.paradex.place_market_order(
             market=self.paradex_market,
             side="BUY",
             size=self.size,
-            price=order_price,
-            post_only=False,
         )
         v_coro = self.variational.place_market_order(
             market=self.variational_market,
@@ -630,16 +626,19 @@ class ArbitrageEngine:
         if p_ok and v_ok:
             # 两边都成功
             self.trade_count += 1
+            # 获取实际成交价格（市价单用订单返回价格，或 BBO ask）
+            actual_price = p_result.price if p_result.price else p_bbo.ask
+
             logger.info(
-                f"[做多成交] #{self.trade_count} Paradex BUY {self.size} @ {order_price} | "
-                f"Variational SELL {self.size}"
+                f"[做多成交] #{self.trade_count} Paradex BUY {self.size} (市价) | "
+                f"Variational SELL {self.size} (市价)"
             )
 
             # 发送 Telegram 成交通知
             if self.telegram:
                 self.telegram.send(
                     f"✅ <b>做多成交 #{self.trade_count}</b>\n\n"
-                    f"• Paradex BUY: {self.size} @ ${order_price:.2f}\n"
+                    f"• Paradex BUY: {self.size} @ ~${actual_price:.2f}\n"
                     f"• Variational SELL: {self.size}\n"
                     f"• 预估净利润: ${profit_info['net_profit']:.2f}"
                 )
@@ -647,17 +646,17 @@ class ArbitrageEngine:
             self.data_logger.log_trade(
                 direction="LONG",
                 paradex_side="BUY",
-                paradex_price=order_price,
+                paradex_price=actual_price,
                 variational_side="SELL",
                 size=self.size,
                 spread=signal.spread,
             )
-            self.trading_logger.log_trade("LONG", self.size, order_price, signal.spread)
+            self.trading_logger.log_trade("LONG", self.size, actual_price, signal.spread)
 
             if self.telegram:
                 self.telegram.send(
                     f"套利成交 [做多] #{self.trade_count}\n"
-                    f"Paradex BUY {self.size} @ {order_price}\n"
+                    f"Paradex BUY {self.size} @ ~${actual_price:.2f}\n"
                     f"Variational SELL {self.size}\n"
                     f"价差: {signal.spread:.4f}"
                 )
@@ -724,20 +723,16 @@ class ArbitrageEngine:
             logger.info("仓位已达上限，跳过做空")
             return
 
-        order_price = p_bbo.bid
-
         logger.info(
-            f"[同时下单] Paradex SELL {self.size} @ {order_price} | "
-            f"Variational BUY {self.size}"
+            f"[同时下单] Paradex SELL {self.size} (市价) | "
+            f"Variational BUY {self.size} (市价)"
         )
 
-        # 双腿同时发送
-        p_coro = self.paradex.place_limit_order(
+        # 双腿同时发送 — 都用市价单确保立即全部成交
+        p_coro = self.paradex.place_market_order(
             market=self.paradex_market,
             side="SELL",
             size=self.size,
-            price=order_price,
-            post_only=False,
         )
         v_coro = self.variational.place_market_order(
             market=self.variational_market,
@@ -759,16 +754,19 @@ class ArbitrageEngine:
         if p_ok and v_ok:
             # 两边都成功
             self.trade_count += 1
+            # 获取实际成交价格（市价单用订单返回价格，或 BBO bid）
+            actual_price = p_result.price if p_result.price else p_bbo.bid
+
             logger.info(
-                f"[做空成交] #{self.trade_count} Paradex SELL {self.size} @ {order_price} | "
-                f"Variational BUY {self.size}"
+                f"[做空成交] #{self.trade_count} Paradex SELL {self.size} (市价) | "
+                f"Variational BUY {self.size} (市价)"
             )
 
             # 发送 Telegram 成交通知
             if self.telegram:
                 self.telegram.send(
                     f"✅ <b>做空成交 #{self.trade_count}</b>\n\n"
-                    f"• Paradex SELL: {self.size} @ ${order_price:.2f}\n"
+                    f"• Paradex SELL: {self.size} @ ~${actual_price:.2f}\n"
                     f"• Variational BUY: {self.size}\n"
                     f"• 预估净利润: ${profit_info['net_profit']:.2f}"
                 )
@@ -776,17 +774,17 @@ class ArbitrageEngine:
             self.data_logger.log_trade(
                 direction="SHORT",
                 paradex_side="SELL",
-                paradex_price=order_price,
+                paradex_price=actual_price,
                 variational_side="BUY",
                 size=self.size,
                 spread=signal.spread,
             )
-            self.trading_logger.log_trade("SHORT", self.size, order_price, signal.spread)
+            self.trading_logger.log_trade("SHORT", self.size, actual_price, signal.spread)
 
             if self.telegram:
                 self.telegram.send(
                     f"套利成交 [做空] #{self.trade_count}\n"
-                    f"Paradex SELL {self.size} @ {order_price}\n"
+                    f"Paradex SELL {self.size} @ ~${actual_price:.2f}\n"
                     f"Variational BUY {self.size}\n"
                     f"价差: {signal.spread:.4f}"
                 )
